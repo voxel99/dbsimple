@@ -1,0 +1,36 @@
+{
+    "name": "jam/dbsimple",
+    "description": "Modernized fork of DbSimple database abstraction layer for PHP 8.1+",
+    "keywords": ["database", "dbsimple", "dbal", "sql", "pdo", "mysql", "postgresql", "sqlite"],
+    "type": "library",
+    "license": "LGPL-2.1-only",
+    "authors": [
+        {
+            "name": "Dmitry Koterov",
+            "homepage": "http://en.dklab.ru",
+            "role": "Original Author"
+        },
+        {
+            "name": "Jam Contributors",
+            "role": "Maintainer"
+        }
+    ],
+    "require": {
+        "php": ">=8.1"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.0 || ^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Jam\\DbSimple\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Jam\\DbSimple\\Tests\\": "tests/"
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
