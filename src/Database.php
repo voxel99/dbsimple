@@ -39,25 +39,6 @@
 namespace Jam\DbSimple;
 
 /**
- * Use this constant as placeholder value to skip optional SQL block [...].
- */
-if (!defined('DBSIMPLE_SKIP')) {
-    define('DBSIMPLE_SKIP', log(0));
-}
-
-/**
- * Names of special columns in result-set which is used
- * as array key (or karent key in forest-based resultsets) in
- * resulting hash.
- */
-if (!defined('DBSIMPLE_ARRAY_KEY')) {
-    define('DBSIMPLE_ARRAY_KEY', 'ARRAY_KEY');   // hash-based resultset support
-}
-if (!defined('DBSIMPLE_PARENT_KEY')) {
-    define('DBSIMPLE_PARENT_KEY', 'PARENT_KEY'); // forrest-based resultset support
-}
-
-/**
  *
  * Base class for all databases.
  * Can create transactions and new BLOBs, parse DSNs.
@@ -67,6 +48,12 @@ if (!defined('DBSIMPLE_PARENT_KEY')) {
  */
 abstract class Database extends LastError implements DatabaseInterface
 {
+    /**
+     * Атрибуты текущего запроса из комментариев в его начале: "-- CACHE: ...", "-- BLOB_OBJ: 1"
+     * @var array<string, string>|null
+     */
+    public $attributes = null;
+
     /**
      * Режим отладки: отключён.
      */
@@ -519,29 +506,6 @@ abstract class Database extends LastError implements DatabaseInterface
         return '?';
     }
 
-    /**
-     * array parseDSN(mixed $dsn)
-     * Parse a data source name.
-     * See parse_url() for details.
-     */
-    protected function parseDSN($dsn)
-    {
-        if (is_array($dsn)) {
-            return $dsn;
-        }
-        $parsed = parse_url($dsn);
-        if (!$parsed) {
-            return null;
-        }
-        $params = null;
-        if (!empty($parsed['query'])) {
-            parse_str($parsed['query'], $params);
-            $parsed += $params;
-        }
-        $parsed['dsn'] = $dsn;
-        return $parsed;
-    }
-
     public function prepareQuery($query)
     {
         return $query;
@@ -788,7 +752,7 @@ abstract class Database extends LastError implements DatabaseInterface
                 # Опциональные блоки {содержимое}
                 \{
                     # "+" вместо "*" — иначе вложенные блоки обрабатываются некорректно.
-                    ( (?> (?>(\??)[^{}]+)  |  (?R) )* )             #1
+                    ( (?> (?>[^{}]+)  |  (?R) )* )                   #1
                 \}
             )
               |
@@ -809,7 +773,7 @@ abstract class Database extends LastError implements DatabaseInterface
      * Callback для preg_replace_callback — обработка одного плейсхолдера.
      *
      * Логика:
-     * - $m[3] — '?' маркер плейсхолдера, $m[4] — тип (d, s, a, #, n, f, _, |, &)
+     * - $m[2] — '?' маркер плейсхолдера, $m[3] — тип (d, s, a, #, n, f, _, |, &)
      * - $m[1] — содержимое опционального блока {...}
      *
      * @param array $m Matches от регулярного выражения
@@ -818,8 +782,8 @@ abstract class Database extends LastError implements DatabaseInterface
     private function _expandPlaceholdersCallback($m)
     {
         // Placeholder.
-        if (!empty($m[3])) {
-            $type = $m[4];
+        if (!empty($m[2])) {
+            $type = $m[3];
 
             // Idenifier prefix.
             if ($type == '_') {
@@ -922,9 +886,14 @@ abstract class Database extends LastError implements DatabaseInterface
                     return empty($value) ? 'NULL' : intval($value);
             }
 
-            // Native arguments are not processed.
+            // Native arguments are not escaped, but typed placeholders are still casted
             if ($this->_placeholderNativeArgs !== null) {
-                $this->_placeholderNativeArgs[] = $value;
+                $this->_placeholderNativeArgs[] = match (true) {
+                    $value === null => null,
+                    $type === 'd' => intval($value),
+                    $type === 'f' => floatval($value),
+                    default => $value,
+                };
                 return $this->_performGetNativePlaceholderMarker(count($this->_placeholderNativeArgs) - 1);
             }
 
@@ -947,33 +916,10 @@ abstract class Database extends LastError implements DatabaseInterface
             return $this->escape($value);
         }
 
-        $prevPh = null;
-
         // Optional block.
         if (isset($m[1]) && strlen($block = $m[1])) {
             $prev = $this->_placeholderNoValueFound;
-            if ($this->_placeholderNativeArgs !== null) {
-                $prevPh = $this->_placeholderNativeArgs;
-            }
-
-            // Проверка на {?  } - условный блок
-            $skip = false;
-            if ($m[2] == '?') {
-                $skip = array_pop($this->_placeholderArgs) === DBSIMPLE_SKIP;
-                $block[0] = ' ';
-            }
-
             $block = $this->_expandOptionalBlock($block);
-
-            if ($skip) {
-                $block = '';
-            }
-
-            if ($this->_placeholderNativeArgs !== null) {
-                if ($this->_placeholderNoValueFound) {
-                    $this->_placeholderNativeArgs = $prevPh;
-                }
-            }
             $this->_placeholderNoValueFound = $prev; // recurrent-safe
 
             return $block;
@@ -1026,16 +972,21 @@ abstract class Database extends LastError implements DatabaseInterface
                 }
             }
         }
+        // Проходим все альтернативы (иначе собьётся порядок значений), выбираем первую,
+        // в которой нет DBSIMPLE_SKIP. Нативные аргументы остаются только от выбранной.
         $r = '';
+        $nativeBefore = $this->_placeholderNativeArgs;
+        $nativeChosen = $nativeBefore;
         foreach ($alts as $block) {
             $this->_placeholderNoValueFound = false;
+            $this->_placeholderNativeArgs = $nativeBefore;
             $block = $this->_expandPlaceholdersFlow($block);
-            // Необходимо пройти все блоки, так как если пропустить оставшиесь,
-            // то это нарушит порядок подставляемых значений
             if (empty($this->_placeholderNoValueFound) && $r === '') {
                 $r = ' ' . $block . ' ';
+                $nativeChosen = $this->_placeholderNativeArgs;
             }
         }
+        $this->_placeholderNativeArgs = $nativeChosen;
         return $r;
     }
 

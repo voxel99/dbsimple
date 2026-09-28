@@ -61,25 +61,6 @@
 namespace Jam\DbSimple;
 
 /**
- * Use this constant as placeholder value to skip optional SQL block [...].
- */
-if (!defined('DBSIMPLE_SKIP')) {
-    define('DBSIMPLE_SKIP', log(0));
-}
-
-/**
- * Names of special columns in result-set which is used
- * as array key (or karent key in forest-based resultsets) in
- * resulting hash.
- */
-if (!defined('DBSIMPLE_ARRAY_KEY')) {
-    define('DBSIMPLE_ARRAY_KEY', 'ARRAY_KEY');   // hash-based resultset support
-}
-if (!defined('DBSIMPLE_PARENT_KEY')) {
-    define('DBSIMPLE_PARENT_KEY', 'PARENT_KEY'); // forrest-based resultset support
-}
-
-/**
  * DbSimple factory.
  */
 class Generic
@@ -102,32 +83,98 @@ class Generic
      */
     public static function connect($dsn)
     {
-        // Load database driver and create its instance.
-        $parsed = Generic::parseDSN($dsn);
-        if (!$parsed) {
-            $dummy = null;
-            return $dummy;
+        $parsed = self::parseDSN($dsn);
+        if (!$parsed || !isset($parsed['scheme'])) {
+            return null;
         }
-        $class = '\\Jam\\DbSimple\\Adapter\\' . ucfirst($parsed['scheme']);
-        if (!class_exists($class)) {
-            throw new \RuntimeException("Error loading database driver " . ucfirst($parsed['scheme']) . ".");
-        }
-        $object = new $class($parsed);
+        $object = self::createAdapter($parsed);
         if (isset($parsed['ident_prefix'])) {
             $object->setIdentPrefix($parsed['ident_prefix']);
         }
         return $object;
     }
 
+    /** @var array<string, class-string<Database>> Зарегистрированные адаптеры: схема DSN => класс */
+    private static array $adapters = [];
+
     /**
-     * array parseDSN(mixed $dsn)
-     * Parse a data source name.
-     * See parse_url() for details.
+     * Зарегистрировать свой адаптер под схемой DSN:
+     *   Generic::registerAdapter('clickhouse', ClickhouseAdapter::class);
+     *   new Connect('clickhouse://user:pass@host/db');
+     *
+     * @param class-string<Database> $class
+     */
+    public static function registerAdapter(string $scheme, string $class): void
+    {
+        if (!is_subclass_of($class, Database::class)) {
+            throw new DatabaseException(sprintf('Adapter %s must extend %s', $class, Database::class));
+        }
+        self::$adapters[strtolower($scheme)] = $class;
+    }
+
+    /**
+     * Класс адаптера по схеме DSN: зарегистрированный или Adapter\{Scheme} ('mypdo' -> Adapter\Mypdo).
+     *
+     * @return class-string<Database>
+     */
+    public static function adapterClass(string $scheme): string
+    {
+        $class = self::$adapters[strtolower($scheme)] ?? 'Jam\\DbSimple\\Adapter\\' . ucfirst($scheme);
+        if (!class_exists($class) || !is_subclass_of($class, Database::class)) {
+            throw new DatabaseException('Unknown database driver: ' . $scheme);
+        }
+        return $class;
+    }
+
+    /**
+     * Создать адаптер. Обработчик ошибок назначается ДО вызова конструктора,
+     * потому что ошибка соединения возникает именно в нём.
+     *
+     * @param array<string, mixed> $parsed Результат parseDSN() (нужен ключ scheme)
+     * @param callable|false|null $errorHandler см. LastError::setErrorHandler()
+     */
+    public static function createAdapter(array $parsed, $errorHandler = null): Database
+    {
+        $class = self::adapterClass((string) $parsed['scheme']);
+        $reflection = new \ReflectionClass($class);
+        /** @var Database $db */
+        $db = $reflection->newInstanceWithoutConstructor();
+        $db->setErrorHandler($errorHandler);
+        $db->__construct($parsed);
+        return $db;
+    }
+
+    /** DSN без пароля — для сообщений об ошибках */
+    public static function maskDsn(string $dsn): string
+    {
+        return (string) preg_replace('#(://[^:/@]+:)[^@]*@#', '$1***@', $dsn);
+    }
+
+    /**
+     * Разбор DSN в массив параметров (scheme, host, port, user, pass, path + параметры query string).
+     *
+     *   mypdo://user:pass@127.0.0.1:3306/app?enc=utf8mb4
+     *   mypdo:unix_socket=/tmp/mysql.sock;dbname=app;user=root   (PDO-подобная запись)
+     *   postgresql://user:pass@127.0.0.1/app
+     *   sqlite:///var/data/app.db   sqlite:/var/data/app.db   sqlite::memory:
+     *
+     * @param string|array<string, mixed> $dsn
+     * @return array<string, mixed>|null
      */
     public static function parseDSN($dsn)
     {
         if (is_array($dsn)) {
             return $dsn;
+        }
+        // Файловые DSN (sqlite:///path) parse_url() не разбирает — путь берём как есть
+        if (preg_match('#^(sqlite):(?://)?([^?]*)(?:\?(.*))?$#i', $dsn, $m)) {
+            $parsed = ['scheme' => strtolower($m[1]), 'path' => $m[2] === '' ? ':memory:' : $m[2]];
+            if (!empty($m[3])) {
+                parse_str($m[3], $params);
+                $parsed += $params;
+            }
+            $parsed['dsn'] = $dsn;
+            return $parsed;
         }
         $parsed = parse_url($dsn);
         if (!$parsed) {
@@ -140,8 +187,8 @@ class Generic
             $parsed += $params;
         }
 
-        if (empty($parsed['host']) && empty($parsed['socket'])) {
-            // Parse as DBO DSN string
+        // PDO-подобная запись параметров: mypdo:unix_socket=/tmp/mysql.sock;dbname=app
+        if (empty($parsed['host']) && empty($parsed['socket']) && str_contains($parsed['path'] ?? '', '=')) {
             $parsedPdo = self::parseDsnPdo($parsed['path']);
             unset($parsed['path']);
             $parsed = array_merge($parsed, $parsedPdo);
