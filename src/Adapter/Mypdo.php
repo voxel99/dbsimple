@@ -32,8 +32,6 @@ use PDOException;
 class Mypdo extends Database implements AdapterInterface, DatabaseInterface
 {
     private $link;
-    public $attributes;
-    private $_lastQuery;
 
     public function __construct($dsn)
     {
@@ -123,7 +121,10 @@ class Mypdo extends Database implements AdapterInterface, DatabaseInterface
      */
     protected function _performQuery($queryMain)
     {
-        $this->_lastQuery = $queryMain;
+        // Соединение не установлено, а обработчик ошибок не прервал выполнение
+        if (!$this->link) {
+            return $this->_setLastError(-1, 'Connection is not established', $queryMain[0]);
+        }
         $this->_expandPlaceholders($queryMain, false);
         $p = $this->link->query($queryMain[0]);
         if (!$p) {

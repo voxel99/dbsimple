@@ -2,155 +2,137 @@
 
 namespace Jam\DbSimple\Adapter;
 
-use Exception;
-use Jam\DbSimple\Database;
 use Jam\DbSimple\AdapterInterface;
+use Jam\DbSimple\Database;
 use Jam\DbSimple\DatabaseInterface;
+use PDO;
+use PDOException;
 
 /**
- * DbSimple_Sqlite: Sqlite2 database.
+ * SQLite через PDO (расширение pdo_sqlite).
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- * See http://www.gnu.org/copyleft/lesser.html
+ * DSN: sqlite:///абсолютный/путь.db, sqlite:относительный.db, sqlite::memory:
+ * Массив параметров: ['path' => ':memory:']
  *
- * Placeholders are emulated because of logging purposes.
+ * Совместимость с MySQL-диалектом: INSERT IGNORE переводится в INSERT OR IGNORE,
+ * идентификаторы экранируются обратными кавычками (SQLite их понимает).
+ * ON DUPLICATE KEY UPDATE, LOCK IN SHARE MODE и SQL_CALC_FOUND_ROWS не поддерживаются.
  *
- * @author Ivan Borzenkov, http://forum.dklab.ru/users/Ivan1986/
- *
- * @version 2.x $Id$
- */
-
-/**
- * Database class for Sqlite.
+ * Прежняя реализация работала через расширение sqlite2 (sqlite_factory),
+ * которого нет в PHP 5.4+.
  */
 class Sqlite extends Database implements AdapterInterface, DatabaseInterface
 {
-    private $link;
+    private ?PDO $link = null;
 
-    public function __construct($dsn)
+    /**
+     * @param array<string, mixed>|string $dsn Результат Generic::parseDSN() или путь к файлу
+     */
+    public function __construct($dsn = ':memory:')
     {
-        if (!function_exists('sqlite_factory')) {
-            $this->_setLastError("-1", "SQLite extension is not loaded", 'sqlite_factory');
-            return;
-        }
-        $err = '';
+        $path = is_array($dsn) ? ($dsn['path'] ?? ':memory:') : $dsn;
         try {
-            $this->link = sqlite_factory($dsn['path'], 0666, $err);
-        } catch (Exception $e) {
-            $this->_setLastError($e->getCode(), $e->getMessage(), 'sqlite_factory');
+            $this->link = new PDO('sqlite:' . $path, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_SILENT]);
+        } catch (PDOException $e) {
+            $this->_setLastError($e->getCode(), $e->getMessage(), 'new PDO(sqlite:' . $path . ')');
         }
     }
 
-    public function createFunction($function_name, $callback, $num_args)
+    /** Нативное соединение PDO (для DDL-скриптов, PRAGMA и т.п.) */
+    public function getPdo(): ?PDO
     {
-        return $this->link->createFunction($function_name, $callback, $num_args);
-    }
-
-    public function createAggregate($function_name, $step_func, $finalize_func, $num_args)
-    {
-        return $this->link->createAggregate($function_name, $step_func, $finalize_func, $num_args);
+        return $this->link;
     }
 
     /**
-     * {@inheritdoc}
+     * Зарегистрировать PHP-функцию для использования в SQL.
      */
+    public function createFunction(string $name, callable $callback, int $numArgs = -1): bool
+    {
+        return $this->link instanceof \Pdo\Sqlite
+            ? $this->link->createFunction($name, $callback, $numArgs)
+            : $this->link->sqliteCreateFunction($name, $callback, $numArgs);
+    }
+
+    public function prepareQuery($query)
+    {
+        $query[0] = preg_replace('/^\s*INSERT\s+IGNORE\s+/i', 'INSERT OR IGNORE ', $query[0]);
+        return $query;
+    }
+
     protected function _performGetPlaceholderIgnoreRe()
     {
         return '
-			"   (?> [^"\\\\]+|\\\\"|\\\\)*    "   |
-			\'  (?> [^\'\\\\]+|\\\\\'|\\\\)* \'   |
-			`   (?> [^`]+ | ``)*              `   |   # backticks
-			/\* .*?                          \*/      # comments
-		/*';
+            "   (?> [^"\\\\]+|\\\\"|\\\\)*    "   |
+            \'  (?> [^\'\\\\]+|\\\\\'|\\\\)* \'   |
+            `   (?> [^`]+ | ``)*              `   |   # backticks
+            /\* .*?                          \*/      # comments
+        ';
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function _performEscape($s, $isIdent = false)
     {
         if (!$isIdent) {
-            return '\'' . sqlite_escape_string($s) . '\'';
-        } else {
-            return "`" . str_replace('`', '``', $s) . "`";
+            return $this->link->quote((string) $s);
         }
+        return '`' . str_replace('`', '``', (string) $s) . '`';
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function _performTransaction($parameters = null)
     {
-        return $this->link->query('BEGIN TRANSACTION');
+        return $this->link->beginTransaction();
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function _performCommit()
     {
-        return $this->link->query('COMMIT TRANSACTION');
+        return $this->link->commit();
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function _performRollback()
     {
-        return $this->link->query('ROLLBACK TRANSACTION');
+        return $this->link->rollBack();
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function _performQuery($queryMain)
     {
-        $this->_lastQuery = $queryMain;
+        if (!$this->link) {
+            return $this->_setLastError(-1, 'Connection is not established', $queryMain[0]);
+        }
         $this->_expandPlaceholders($queryMain, false);
-        $error_msg = '';
-        $p = $this->link->query($queryMain[0], SQLITE_ASSOC, $error_msg);
+        $p = $this->link->query($queryMain[0]);
         if (!$p) {
-            return $this->_setDbError($queryMain[0]);
+            $info = $this->link->errorInfo();
+            return $this->_setLastError($info[1], $info[2], $queryMain[0]);
         }
         if (preg_match('/^\s* INSERT \s+/six', $queryMain[0])) {
-            return $this->link->lastInsertRowid();
+            return $this->link->lastInsertId();
         }
-        if ($p->numFields() == 0) {
-            return $this->link->changes();
+        if ($p->columnCount() == 0) {
+            return $p->rowCount();
         }
-        //Если у нас в запросе есть хотя-бы одна колонка - это по любому будет select
-        return $p->fetchAll(SQLITE_ASSOC);
+        $rows = $p->fetchAll(PDO::FETCH_ASSOC);
+        $p->closeCursor();
+        return $rows;
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function _performTransformQuery(&$queryMain, $how)
     {
-        // If we also need to calculate total number of found rows...
         switch ($how) {
-            // Prepare total calculation (if possible)
             case 'CALC_TOTAL':
-                // Not possible
                 return true;
-
-            // Perform total calculation.
             case 'GET_TOTAL':
-                // TODO: GROUP BY ... -> COUNT(DISTINCT ...)
-                $re = '/^
-					(?> -- [^\r\n]* | \s+)*
-					(\s* SELECT \s+)                                             #1
-					(.*?)                                                        #2
-					(\s+ FROM \s+ .*?)                                           #3
-						((?:\s+ ORDER \s+ BY \s+ .*?)?)                          #4
-						((?:\s+ LIMIT \s+ \S+ \s* (?: , \s* \S+ \s*)? )?)  #5
-				$/six';
+                // Отдельный COUNT(*) по тому же запросу без ORDER BY / LIMIT
                 $m = null;
+                $re = '/^
+                    (?> -- [^\r\n]* | \s+)*
+                    (\s* SELECT \s+)                                              #1
+                    (.*?)                                                         #2
+                    (\s+ FROM \s+ .*?)                                            #3
+                    ((?:\s+ ORDER \s+ BY \s+ .*?)?)                               #4
+                    ((?:\s+ LIMIT \s+ \S+ \s* (?: (?:,|OFFSET) \s* \S+ \s*)? )?)  #5
+                $/six';
                 if (preg_match($re, $queryMain[0], $m)) {
-                    $queryMain[0] = $m[1] . $this->_fieldList2Count($m[2]) . " AS C" . $m[3];
+                    $queryMain[0] = $m[1] . $this->_fieldList2Count($m[2]) . ' AS C' . $m[3];
                     $skipTail = substr_count($m[4] . $m[5], '?');
                     if ($skipTail) {
                         array_splice($queryMain, -$skipTail);
@@ -158,33 +140,19 @@ class Sqlite extends Database implements AdapterInterface, DatabaseInterface
                 }
                 return true;
         }
-
         return false;
     }
 
-    protected function _setDbError($query)
-    {
-        return $this->_setLastError($this->link->lastError(), sqlite_error_string($this->link->lastError()), $query);
-    }
-
-    /**
-     * {@inheritdoc}
-     */
     protected function _performNewBlob($id = null)
     {
+        return null;
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function _performGetBlobFieldNames($result)
     {
-        return array();
+        return [];
     }
 
-    /**
-     * {@inheritdoc}
-     */
     protected function _performFetch($result)
     {
         return $result;

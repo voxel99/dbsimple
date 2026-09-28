@@ -1,120 +1,163 @@
 <?php
 
-/**
- * Используйте константу DBSIMPLE_SKIP в качестве подстановочного значения чтобы пропустить опцональный SQL блок.
- */
-
 namespace Jam\DbSimple;
 
-if (!defined('DBSIMPLE_SKIP')) {
-    define('DBSIMPLE_SKIP', log(0));
-}
 /**
- * Имена специализированных колонок в резальтате,
- * которые используются как ключи в результирующем массиве
- */
-define('DBSIMPLE_ARRAY_KEY', 'ARRAY_KEY');   // hash-based resultset support
-define('DBSIMPLE_PARENT_KEY', 'PARENT_KEY'); // forrest-based resultset support
-
-/**
- * Класс обертка для DbSimple
+ * Ленивое соединение: адаптер создаётся и подключается при первом запросе.
  *
- * нужен для ленивой инициализации коннекта к базе
+ * <code>
+ * $db = new Connect('mypdo://user:pass@127.0.0.1/app?enc=utf8mb4');
+ * $db->addInit('SET time_zone = ?', '+00:00'); // выполнится сразу после подключения
+ * $rows = $db->select('SELECT * FROM users WHERE id IN (?a)', [1, 2]); // здесь происходит подключение
+ * </code>
  *
- * @package DbSimple
- * @method mixed debugSql(int $debug)
- * @method bool isDebugSql(int $debug = 1)
- * @method mixed query(string $query, mixed ...$args)
- * @method mixed select(string $query, mixed ...$args)
- * @method mixed selectCell(string $query, mixed ...$args)
- * @method mixed selectCol(string $query, mixed ...$args)
- * @method mixed selectRow(string $query, mixed ...$args)
- * @method mixed subquery(string $query, mixed ...$args)
+ * Схема DSN выбирает адаптер: mypdo -> Adapter\Mypdo, postgresql -> Adapter\Postgresql,
+ * sqlite -> Adapter\Sqlite. Остальные методы адаптера (debugSql(), createFunction() и т.п.)
+ * доступны через __call().
+ *
+ * @method void debugSql(int|callable $debug)
+ * @method bool isDebugSql(int|callable $debug)
  */
-class Connect
+class Connect implements DatabaseInterface
 {
-    /** @var Database|null База данных */
-    protected $DbSimple;
+    /** Адаптер (null до первого запроса) */
+    protected ?Database $DbSimple = null;
 
     /** @var string DSN подключения */
     protected $DSN;
 
-    /** @var string Тип базы данных */
+    /** @var string Имя адаптера из схемы DSN (Mypdo, Postgresql, Sqlite) */
     protected $shema;
 
-    /** @var array<int, array<int, mixed>> Что выставить при коннекте */
-    protected $init;
+    /** @var array<int, array<int, mixed>> Запросы, выполняемые сразу после подключения */
+    protected $init = [];
 
-    /** @var integer код ошибки */
+    /** @var array|null Последняя ошибка (после подключения — ссылка на $error адаптера) */
     public $error = null;
 
-    /** @var string сообщение об ошибке */
+    /** @var string|null Текст последней ошибки */
     public $errmsg = null;
 
-    /** @var callable|null|false обработчик ошибок */
+    /** @var callable|false|null См. LastError::$errorHandler */
     private $errorHandler = null;
-    private $_identPrefix = null;
-    private $_logger = null;
+    private $identPrefix = null;
+    private $logger = null;
 
     /**
-     * Конструктор только запоминает переданный DSN
-     * создание класса и коннект происходит позже
-     *
      * @param string $dsn DSN строка БД
      */
     public function __construct($dsn)
     {
-        $this->DbSimple = null;
         $this->DSN = $dsn;
-        $this->init = array();
-        $this->shema = ucfirst(substr($dsn, 0, strpos($dsn, ':')));
+        $this->shema = ucfirst(substr($dsn, 0, (int) strpos($dsn, ':')));
     }
 
     /**
-     * Взять базу из пула коннектов
-     *
-     * @param string $dsn DSN строка БД
-     * @return self
+     * Соединение из пула: один объект на DSN в рамках процесса.
      */
-    public static function get($dsn)
+    public static function get($dsn): self
     {
-        static $pool = array();
-        return isset($pool[$dsn]) ? $pool[$dsn] : $pool[$dsn] = new self($dsn);
+        static $pool = [];
+        return $pool[$dsn] ??= new self($dsn);
     }
 
-    /**
-     * Возвращает тип базы данных
-     *
-     * @return string имя типа БД
-     */
+    /** @return string Имя адаптера (Mypdo, Postgresql, Sqlite) */
     public function getShema()
     {
         return $this->shema;
     }
 
-    /**
-     * Коннект при первом запросе к базе данных
-     */
-    public function __call($method, $params)
+    /** Подключиться (если ещё не подключены) и вернуть адаптер. */
+    public function getDatabase(): Database
     {
         if ($this->DbSimple === null) {
             $this->connect($this->DSN);
         }
-        return call_user_func_array(array(&$this->DbSimple, $method), $params);
+        return $this->DbSimple;
+    }
+
+    public function isConnected(): bool
+    {
+        return $this->DbSimple !== null;
     }
 
     /**
-     * mixed selectPage(int &$total, string $query [, $arg1] [,$arg2] ...)
-     * Функцию нужно вызвать отдельно из-за передачи по ссылке
+     * Прочие методы адаптера (debugSql(), createFunction() и т.п.)
      */
-    public function selectPage(&$total, $query)
+    public function __call($method, $params)
     {
-        if ($this->DbSimple === null) {
-            $this->connect($this->DSN);
-        }
-        $args = func_get_args();
-        $args[0] = &$total;
-        return call_user_func_array(array(&$this->DbSimple, 'selectPage'), $args);
+        return $this->getDatabase()->$method(...$params);
+    }
+
+    public function select(...$query)
+    {
+        return $this->getDatabase()->select(...$query);
+    }
+
+    public function selectPage(&$total, ...$query)
+    {
+        return $this->getDatabase()->selectPage($total, ...$query);
+    }
+
+    public function selectRow(...$query)
+    {
+        return $this->getDatabase()->selectRow(...$query);
+    }
+
+    public function selectCol(...$query)
+    {
+        return $this->getDatabase()->selectCol(...$query);
+    }
+
+    public function selectCell(...$query)
+    {
+        return $this->getDatabase()->selectCell(...$query);
+    }
+
+    public function query(...$query)
+    {
+        return $this->getDatabase()->query(...$query);
+    }
+
+    public function subquery(...$query)
+    {
+        return $this->getDatabase()->subquery(...$query);
+    }
+
+    public function escape($s, $isIdent = false)
+    {
+        return $this->getDatabase()->escape($s, $isIdent);
+    }
+
+    public function transaction($mode = null)
+    {
+        return $this->getDatabase()->transaction($mode);
+    }
+
+    public function commit()
+    {
+        return $this->getDatabase()->commit();
+    }
+
+    public function rollback()
+    {
+        return $this->getDatabase()->rollback();
+    }
+
+    public function blob($blob_id = null)
+    {
+        return $this->getDatabase()->blob($blob_id);
+    }
+
+    public function setClassName($name)
+    {
+        $this->getDatabase()->setClassName($name);
+        return $this;
+    }
+
+    public function getStatistics()
+    {
+        return $this->DbSimple ? $this->DbSimple->getStatistics() : ['time' => 0, 'count' => 0];
     }
 
     /**
@@ -123,134 +166,97 @@ class Connect
      */
     public function connect($dsn)
     {
-        $parsed = $this->parseDSN($dsn);
-        if (!$parsed) {
-            $this->errorHandler('Ошибка разбора строки DSN', $dsn);
+        $parsed = Generic::parseDSN($dsn);
+        if (!$parsed || !isset($parsed['scheme'])) {
+            throw new DatabaseException('Cannot parse DSN or detect database driver: ' . Generic::maskDsn((string) $dsn));
         }
-        if (!isset($parsed['scheme'])) {
-            $this->errorHandler('Невозможно загрузить драйвер базы данных', $parsed);
-        }
+
         $this->shema = ucfirst($parsed['scheme']);
-        $class = '\\Jam\\DbSimple\\Adapter\\' . $this->shema;
-        if (!class_exists($class)) {
-            throw new \RuntimeException("Error loading database driver " . ucfirst($parsed['scheme']) . ".");
-        }
+        // Обработчик нужен до конструктора адаптера: ошибка соединения возникает именно там
+        $db = Generic::createAdapter($parsed, $this->errorHandler);
+        $this->DbSimple = $db;
+        $this->errmsg = &$db->errmsg;
+        $this->error = &$db->error;
 
-        $this->DbSimple = new $class($parsed);
-        $this->errmsg = &$this->DbSimple->errmsg;
-        $this->error = &$this->DbSimple->error;
-        $prefix = isset($parsed['prefix']) ? $parsed['prefix'] : ($this->_identPrefix ? $this->_identPrefix : false);
+        $prefix = $parsed['prefix'] ?? $this->identPrefix;
         if ($prefix) {
-            $this->DbSimple->setIdentPrefix($prefix);
+            $db->setIdentPrefix($prefix);
         }
-        if ($this->_logger) {
-            $this->DbSimple->setLogger($this->_logger);
-        }
-        $this->DbSimple->setErrorHandler($this->errorHandler !== null ? $this->errorHandler : array(&$this, 'errorHandler'));
-        //выставление переменных
-        foreach ($this->init as $query) {
-            call_user_func_array(array(&$this->DbSimple, 'query'), $query);
+        if ($this->logger) {
+            $db->setLogger($this->logger);
         }
 
-        $this->init = array();
+        foreach ($this->init as $query) {
+            $db->query(...$query);
+        }
+        $this->init = [];
     }
 
     /**
-     * Функция обработки ошибок - стандартный обработчик
-     * Все вызовы без @ прекращают выполнение скрипта
+     * Обработчик ошибок «по умолчанию» (для совместимости с кодом, который передаёт
+     * [$connect, 'errorHandler']): бросает DatabaseException.
      *
      * @param string $msg Сообщение об ошибке
      * @param array<string, mixed>|string $info Подробная информация о контексте ошибки
      */
     public function errorHandler($msg, $info)
     {
-        // Если использовалась @, ничего не делать.
-        if (!error_reporting()) {
-            return;
-        }
-        // Выводим подробную информацию об ошибке.
-        echo "SQL Error: $msg<br><pre>";
-        print_r($info);
-        echo "</pre>";
-        exit();
+        throw new DatabaseException($msg, is_array($info) ? $info : []);
     }
 
     /**
-     * Выставляет запрос для инициализации
+     * Запрос, выполняемый сразу после подключения (SET NAMES, time_zone и т.п.).
+     * Если соединение уже установлено — выполняется немедленно.
      *
      * @param string $query запрос
      * @return mixed
      */
-    public function addInit($query)
+    public function addInit($query, ...$args)
     {
-        $args = func_get_args();
         if ($this->DbSimple !== null) {
-            return call_user_func_array(array(&$this->DbSimple, 'query'), $args);
+            return $this->DbSimple->query($query, ...$args);
         }
-        $this->init[] = $args;
+        $this->init[] = [$query, ...$args];
         return null;
     }
 
     /**
-     * Устанавливает новый обработчик ошибок
-     * Обработчик получает 2 аргумента:
-     * - сообщение об ошибке
-     * - массив (код, сообщение, запрос, контекст)
+     * Установить обработчик ошибок.
      *
-     * @param callable|null|false $handler обработчик ошибок
-     * <br>  null - по умолчанию
-     * <br>  false - отключен
-     * @return callable|null|false предыдущий обработчик
+     * @param callable|false|null $handler
+     *   null — по умолчанию (DatabaseException), false — отключен, callable($message, array $info)
+     * @return callable|false|null предыдущий обработчик
      */
     public function setErrorHandler($handler)
     {
         $prev = $this->errorHandler;
         $this->errorHandler = $handler;
-        if ($this->DbSimple) {
-            $this->DbSimple->setErrorHandler($handler);
-        }
+        $this->DbSimple?->setErrorHandler($handler);
         return $prev;
     }
 
     /**
-     * callback setLogger(callback $logger)
-     * Set query logger called before each query is executed.
-     * Returns previous logger.
+     * Логгер, вызываемый перед каждым запросом: function ($db, string $sql, ?array $caller).
+     * Возвращает предыдущий логгер.
      */
     public function setLogger($logger)
     {
-        $prev = $this->_logger;
-        $this->_logger = $logger;
-        if ($this->DbSimple) {
-            $this->DbSimple->setLogger($logger);
-        }
+        $prev = $this->logger;
+        $this->logger = $logger;
+        $this->DbSimple?->setLogger($logger);
         return $prev;
     }
 
     /**
-     * string setIdentPrefix($prx)
-     * Set identifier prefix used for $_ placeholder.
+     * Префикс таблиц для плейсхолдера ?_ (SELECT * FROM ?_users -> app_users).
      */
     public function setIdentPrefix($prx)
     {
-        $old = $this->_identPrefix;
+        $old = $this->identPrefix;
         if ($prx !== null) {
-            $this->_identPrefix = $prx;
+            $this->identPrefix = $prx;
         }
-        if ($this->DbSimple) {
-            $this->DbSimple->setIdentPrefix($prx);
-        }
+        $this->DbSimple?->setIdentPrefix($prx);
         return $old;
-    }
-
-    /**
-     * Разбирает строку DSN в массив параметров подключения к базе
-     *
-     * @param string $dsn строка DSN для разбора
-     * @return array<string, mixed> Параметры коннекта (scheme, host, port, user, pass, path, etc)
-     */
-    protected function parseDSN($dsn)
-    {
-        return Generic::parseDSN($dsn);
     }
 }

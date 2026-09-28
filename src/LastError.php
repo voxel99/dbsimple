@@ -8,10 +8,22 @@ namespace Jam\DbSimple;
  */
 abstract class LastError
 {
+    /** @var array{code: mixed, message: string, query: mixed, context: string}|null Последняя ошибка */
     public $error = null;
+    /** @var string|null Текст последней ошибки с местом вызова */
     public $errmsg = null;
+
+    /**
+     * Обработчик ошибок:
+     *   null     — по умолчанию: бросить DatabaseException;
+     *   false    — ничего не делать (методы вернут false, детали — в $error/$errmsg);
+     *   callable — function (string $message, array $info): void.
+     * @var callable|false|null
+     */
     private $errorHandler = null;
-    private $ignoresInTraceRe = 'DbSimple\\.*::.* | call_user_func.*';
+
+    /** @var array<int, string> Регулярные выражения "Class::method", пропускаемые при поиске места вызова */
+    private array $ignoresInTrace = [];
 
     /**
      * abstract void _logQuery($query)
@@ -49,11 +61,19 @@ abstract class LastError
 
         $this->_logQuery("  -- error #" . $code . ": " . preg_replace('/(\r?\n)+/s', ' ', $this->errmsg));
 
+        $this->handleError();
+
+        return false;
+    }
+
+    private function handleError(): void
+    {
+        if ($this->errorHandler === null) {
+            throw new DatabaseException($this->errmsg, $this->error);
+        }
         if (is_callable($this->errorHandler)) {
             call_user_func($this->errorHandler, $this->errmsg, $this->error);
         }
-
-        return false;
     }
 
     /**
@@ -67,103 +87,50 @@ abstract class LastError
     {
         $prev = $this->errorHandler;
         $this->errorHandler = $handler;
-        // In case of setting first error handler for already existed
-        // error - call the handler now (usual after connect()).
-        if (!$prev && $this->error && $this->errorHandler) {
-            call_user_func($this->errorHandler, $this->errmsg, $this->error);
+        // Ошибка уже есть (например, соединения в конструкторе при отключённом обработчике) —
+        // сообщаем о ней новому обработчику сразу
+        if ($prev === false && $this->error && is_callable($handler)) {
+            call_user_func($handler, $this->errmsg, $this->error);
         }
         return $prev;
     }
 
     /**
-     * void addIgnoreInTrace($reName)
-     * Add regular expression matching ClassName::functionName or functionName.
-     * Matched stack frames will be ignored in stack traces passed to query logger.
+     * Не считать местом вызова методы, подходящие под регулярное выражение по "Class::method"
+     * (например, слой моделей поверх DbSimple: 'Jam\\Models\\.*').
      */
     public function addIgnoreInTrace($name)
     {
-        $this->ignoresInTraceRe .= "|" . $name;
+        $this->ignoresInTrace[] = $name;
     }
 
     /**
-     * array of array findLibraryCaller()
-     * Return part of stacktrace before calling first library method.
-     * Used in debug purposes (query logging etc.).
+     * Первый кадр стека вне DbSimple: файл и строка прикладного кода, выполнившего запрос.
+     * Используется в сообщениях об ошибках и логгере.
+     *
+     * @return array<string, mixed>|null
      */
     public function findLibraryCaller()
     {
-        $caller = call_user_func(
-            array(&$this, 'debug_backtrace_smart'),
-            $this->ignoresInTraceRe,
-            true
-        );
-        return $caller;
-    }
+        $trace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS);
+        $ignoreRe = $this->ignoresInTrace ? '/^(?:' . implode('|', $this->ignoresInTrace) . ')$/sx' : null;
 
-    /**
-     * array debug_backtrace_smart($ignoresRe=null, $returnCaller=false)
-     *
-     * Return stacktrace. Correctly work with call_user_func*
-     * (totally skip them correcting caller references).
-     * If $returnCaller is true, return only first matched caller,
-     * not all stacktrace.
-     *
-     * @version 2.03
-     */
-    private function debug_backtrace_smart($ignoresRe = null, $returnCaller = false)
-    {
-        $trace = debug_backtrace();
-
-        if ($ignoresRe !== null) {
-            $ignoresRe = "/^(?>{$ignoresRe})$/six";
+        foreach ($trace as $i => $frame) {
+            if (!isset($frame['file']) || str_starts_with($frame['file'], __DIR__ . DIRECTORY_SEPARATOR)) {
+                continue;
+            }
+            // Функция, внутри которой сделан этот вызов
+            $caller = $trace[$i + 1] ?? [];
+            $callerClass = $caller['class'] ?? null;
+            if ($callerClass && is_a($callerClass, self::class, true)) {
+                continue; // адаптер, объявленный вне пакета
+            }
+            $callerName = ($callerClass ? $callerClass . '::' : '') . ($caller['function'] ?? '');
+            if ($ignoreRe && $callerName !== '' && preg_match($ignoreRe, $callerName)) {
+                continue;
+            }
+            return $frame;
         }
-        $smart = array();
-        $framesSeen = 0;
-        for ($i = 0, $n = count($trace); $i < $n; $i++) {
-            $t = $trace[$i];
-            if (!$t) {
-                continue;
-            }
-
-            // Next frame.
-            $next = isset($trace[$i + 1]) ? $trace[$i + 1] : null;
-
-            // Dummy frame before call_user_func* frames.
-            if (!isset($t['file'])) {
-                $t['over_function'] = $trace[$i + 1]['function'];
-                $t = $t + $trace[$i + 1];
-                $trace[$i + 1] = null; // skip call_user_func on next iteration
-                $next = isset($trace[$i + 2]) ? $trace[$i + 2] : null; // Correct Next frame.
-            }
-
-            // Skip myself frame.
-            if (++$framesSeen < 2) {
-                continue;
-            }
-
-            // 'class' and 'function' field of next frame define where
-            // this frame function situated. Skip frames for functions
-            // situated in ignored places.
-            if ($ignoresRe && $next) {
-                // Name of function "inside which" frame was generated.
-                $frameCaller = (isset($next['class']) ? $next['class'] . '::' : '') . (isset($next['function']) ? $next['function'] : '');
-                if (preg_match($ignoresRe, $frameCaller)) {
-                    continue;
-                }
-            }
-
-            if (isset($t['class']) && strpos($t['class'], "Jam\\DbSimple") !== false) {
-                continue;
-            }
-
-            // On each iteration we consider ability to add PREVIOUS frame
-            // to $smart stack.
-            if ($returnCaller) {
-                return $t;
-            }
-            $smart[] = $t;
-        }
-
-        return $smart;
+        return null;
     }
 }

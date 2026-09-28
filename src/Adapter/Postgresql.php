@@ -31,9 +31,17 @@ use Jam\DbSimple\DatabaseInterface;
  */
 class Postgresql extends Database implements AdapterInterface, DatabaseInterface
 {
-    public $DbSimple_Postgresql_USE_NATIVE_PHOLDERS = null;
-    public $prepareCache = array();
-    public $link;
+    /** Использовать нативные плейсхолдеры ($1, $2) через pg_prepare/pg_execute */
+    public bool $useNativePlaceholders = true;
+
+    /** @var array<string, true> Уже подготовленные запросы (по md5 текста) */
+    public array $prepareCache = [];
+
+    /** @var \PgSql\Connection|false|null */
+    public $link = null;
+
+    /** @var array<int, mixed>|string|null Последний запрос (для сообщений об ошибке fetch) */
+    private $lastQuery = null;
 
     /**
      * constructor(string $dsn)
@@ -47,15 +55,13 @@ class Postgresql extends Database implements AdapterInterface, DatabaseInterface
             return;
         }
 
-        // Prepare+execute works only in PHP 5.1+.
-        $this->DbSimple_Postgresql_USE_NATIVE_PHOLDERS = function_exists('pg_prepare');
 
         $dsnWithoutPass = (!empty($p['host']) ? 'host=' . $p['host'] . ' ' : '') .
             (!empty($p['port']) ? 'port=' . $p['port'] . ' ' : '') .
             'dbname=' . preg_replace('{^/}s', '', $p['path']) . ' ' .
             (!empty($p['user']) ? 'user=' . $p['user'] : '');
 
-        $ok = $this->link = pg_connect($dsnWithoutPass . " " . (!empty($p['pass']) ? 'password=' . $p['pass'] . ' ' : ''), PGSQL_CONNECT_FORCE_NEW);
+        $ok = $this->link = @pg_connect($dsnWithoutPass . " " . (!empty($p['pass']) ? 'password=' . $p['pass'] . ' ' : ''), PGSQL_CONNECT_FORCE_NEW);
         // We use PGSQL_CONNECT_FORCE_NEW, because in PHP 5.3 & PHPUnit
         // $this->prepareCache may be cleaned, but $this->link is still
         // not closed. So the next creation of DbSimple_Postgresql()
@@ -78,7 +84,7 @@ class Postgresql extends Database implements AdapterInterface, DatabaseInterface
         if (!$isIdent) {
             return "E'" . pg_escape_string($this->link, $s) . "'";
         } else {
-            return '"' . str_replace('"', '_', $s) . '"';
+            return '"' . str_replace('"', '""', $s) . '"';
         }
     }
 
@@ -193,7 +199,7 @@ class Postgresql extends Database implements AdapterInterface, DatabaseInterface
      */
     protected function _performQuery($queryMain)
     {
-        $this->_lastQuery = $queryMain;
+        $this->lastQuery = $queryMain;
         $isInsert = preg_match('/^\s* INSERT \s+/six', $queryMain[0]);
 
         //
@@ -207,25 +213,25 @@ class Postgresql extends Database implements AdapterInterface, DatabaseInterface
         // of result of RULE query. Strange, very strange...
         //
 
-        if ($this->DbSimple_Postgresql_USE_NATIVE_PHOLDERS && !$isInsert) {
+        if ($this->useNativePlaceholders && !$isInsert) {
             // Use native placeholders only if PG supports them.
             $this->_expandPlaceholders($queryMain, true);
             $hash = md5($queryMain[0]);
             if (!isset($this->prepareCache[$hash])) {
-                $prepared = pg_prepare($this->link, $hash, $queryMain[0]);
+                $prepared = @pg_prepare($this->link, $hash, $queryMain[0]);
                 if ($prepared === false) {
-                    return $this->_setDbError($queryMain[0]);
+                    return $this->_setDbError($queryMain);
                 } else {
                     $this->prepareCache[$hash] = true;
                 }
             } else {
                 // Prepare cache hit!
             }
-            $result = pg_execute($this->link, $hash, array_slice($queryMain, 1));
+            $result = @pg_execute($this->link, $hash, array_slice($queryMain, 1));
         } else {
             // No support for native placeholders on INSERT query.
             $this->_expandPlaceholders($queryMain, false);
-            $result = pg_query($this->link, $queryMain[0]);
+            $result = @pg_query($this->link, $queryMain[0]);
         }
 
         if ($result === false) {
@@ -260,13 +266,34 @@ class Postgresql extends Database implements AdapterInterface, DatabaseInterface
     {
         $row = pg_fetch_assoc($result);
         if (pg_last_error($this->link)) {
-            return $this->_setDbError($this->_lastQuery);
+            return $this->_setDbError($this->lastQuery);
         }
         return $row;
     }
 
+    /**
+     * @param array<int, mixed>|string $query Запрос; при нативных плейсхолдерах — [sql, $1, $2, ...]
+     */
     public function _setDbError($query)
     {
-        return $this->_setLastError(null, $this->link ? pg_last_error($this->link) : (is_array($query) ? "Connection is not established" : $query), $query);
+        $message = $this->link ? pg_last_error($this->link) : (is_array($query) ? 'Connection is not established' : $query);
+        return $this->_setLastError(null, $message, $this->readableQuery($query));
+    }
+
+    /**
+     * SQL для сообщения об ошибке: нативные $1, $2 заменяются экранированными значениями.
+     *
+     * @param array<int, mixed>|string $query
+     */
+    private function readableQuery($query): string
+    {
+        if (!is_array($query)) {
+            return (string) $query;
+        }
+        $args = array_slice($query, 1);
+        return (string) preg_replace_callback('/\$(\d+)/', function (array $m) use ($args) {
+            $value = $args[(int) $m[1] - 1] ?? null;
+            return $value === null ? 'NULL' : ($this->link ? $this->escape($value) : "'" . $value . "'");
+        }, (string) $query[0]);
     }
 }
